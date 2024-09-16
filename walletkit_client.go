@@ -27,13 +27,14 @@ type WalletKitClient interface {
 	ListUnspent(ctx context.Context, minConfs, maxConfs int32) (
 		[]*lnwallet.Utxo, error)
 
-	// LeaseOutput locks an output to the given ID, preventing it from being
-	// available for any future coin selection attempts. The absolute time
-	// of the lock's expiration is returned. The expiration of the lock can
-	// be extended by successive invocations of this call. Outputs can be
-	// unlocked before their expiration through `ReleaseOutput`.
+	// LeaseOutput locks an output to the given ID for the lease time
+	// provided, preventing it from being available for any future coin
+	// selection attempts. The absolute time of the lock's expiration is
+	// returned. The expiration of the lock can be extended by successive
+	// invocations of this call. Outputs can be unlocked before their
+	// expiration through `ReleaseOutput`.
 	LeaseOutput(ctx context.Context, lockID wtxmgr.LockID,
-		op wire.OutPoint) (time.Time, error)
+		op wire.OutPoint, leaseTime time.Duration) (time.Time, error)
 
 	// ReleaseOutput unlocks an output, allowing it to be available for coin
 	// selection if it remains unspent. The ID should match the one used to
@@ -75,18 +76,20 @@ type WalletKitClient interface {
 type walletKitClient struct {
 	client       walletrpc.WalletKitClient
 	walletKitMac serializedMacaroon
+	timeout      time.Duration
 }
 
 // A compile-time constraint to ensure walletKitclient satisfies the
 // WalletKitClient interface.
 var _ WalletKitClient = (*walletKitClient)(nil)
 
-func newWalletKitClient(conn *grpc.ClientConn,
-	walletKitMac serializedMacaroon) *walletKitClient {
+func newWalletKitClient(conn grpc.ClientConnInterface,
+	walletKitMac serializedMacaroon, timeout time.Duration) *walletKitClient {
 
 	return &walletKitClient{
 		client:       walletrpc.NewWalletKitClient(conn),
 		walletKitMac: walletKitMac,
+		timeout:      timeout,
 	}
 }
 
@@ -95,7 +98,7 @@ func newWalletKitClient(conn *grpc.ClientConn,
 func (m *walletKitClient) ListUnspent(ctx context.Context, minConfs,
 	maxConfs int32) ([]*lnwallet.Utxo, error) {
 
-	rpcCtx, cancel := context.WithTimeout(ctx, rpcTimeout)
+	rpcCtx, cancel := context.WithTimeout(ctx, m.timeout)
 	defer cancel()
 
 	rpcCtx = m.walletKitMac.WithMacaroonAuth(rpcCtx)
@@ -151,9 +154,9 @@ func (m *walletKitClient) ListUnspent(ctx context.Context, minConfs,
 // successive invocations of this call. Outputs can be unlocked before their
 // expiration through `ReleaseOutput`.
 func (m *walletKitClient) LeaseOutput(ctx context.Context, lockID wtxmgr.LockID,
-	op wire.OutPoint) (time.Time, error) {
+	op wire.OutPoint, leaseTime time.Duration) (time.Time, error) {
 
-	rpcCtx, cancel := context.WithTimeout(ctx, rpcTimeout)
+	rpcCtx, cancel := context.WithTimeout(ctx, m.timeout)
 	defer cancel()
 
 	rpcCtx = m.walletKitMac.WithMacaroonAuth(rpcCtx)
@@ -163,6 +166,7 @@ func (m *walletKitClient) LeaseOutput(ctx context.Context, lockID wtxmgr.LockID,
 			TxidBytes:   op.Hash[:],
 			OutputIndex: op.Index,
 		},
+		ExpirationSeconds: uint64(leaseTime.Seconds()),
 	})
 	if err != nil {
 		return time.Time{}, err
@@ -177,7 +181,7 @@ func (m *walletKitClient) LeaseOutput(ctx context.Context, lockID wtxmgr.LockID,
 func (m *walletKitClient) ReleaseOutput(ctx context.Context,
 	lockID wtxmgr.LockID, op wire.OutPoint) error {
 
-	rpcCtx, cancel := context.WithTimeout(ctx, rpcTimeout)
+	rpcCtx, cancel := context.WithTimeout(ctx, m.timeout)
 	defer cancel()
 
 	rpcCtx = m.walletKitMac.WithMacaroonAuth(rpcCtx)
@@ -194,7 +198,7 @@ func (m *walletKitClient) ReleaseOutput(ctx context.Context,
 func (m *walletKitClient) DeriveNextKey(ctx context.Context, family int32) (
 	*keychain.KeyDescriptor, error) {
 
-	rpcCtx, cancel := context.WithTimeout(ctx, rpcTimeout)
+	rpcCtx, cancel := context.WithTimeout(ctx, m.timeout)
 	defer cancel()
 
 	rpcCtx = m.walletKitMac.WithMacaroonAuth(rpcCtx)
@@ -222,7 +226,7 @@ func (m *walletKitClient) DeriveNextKey(ctx context.Context, family int32) (
 func (m *walletKitClient) DeriveKey(ctx context.Context, in *keychain.KeyLocator) (
 	*keychain.KeyDescriptor, error) {
 
-	rpcCtx, cancel := context.WithTimeout(ctx, rpcTimeout)
+	rpcCtx, cancel := context.WithTimeout(ctx, m.timeout)
 	defer cancel()
 
 	rpcCtx = m.walletKitMac.WithMacaroonAuth(rpcCtx)
@@ -248,7 +252,7 @@ func (m *walletKitClient) DeriveKey(ctx context.Context, in *keychain.KeyLocator
 func (m *walletKitClient) NextAddr(ctx context.Context) (
 	btcutil.Address, error) {
 
-	rpcCtx, cancel := context.WithTimeout(ctx, rpcTimeout)
+	rpcCtx, cancel := context.WithTimeout(ctx, m.timeout)
 	defer cancel()
 
 	rpcCtx = m.walletKitMac.WithMacaroonAuth(rpcCtx)
@@ -273,7 +277,7 @@ func (m *walletKitClient) PublishTransaction(ctx context.Context,
 		return err
 	}
 
-	rpcCtx, cancel := context.WithTimeout(ctx, rpcTimeout)
+	rpcCtx, cancel := context.WithTimeout(ctx, m.timeout)
 	defer cancel()
 
 	rpcCtx = m.walletKitMac.WithMacaroonAuth(rpcCtx)
@@ -297,7 +301,7 @@ func (m *walletKitClient) SendOutputs(ctx context.Context,
 		}
 	}
 
-	rpcCtx, cancel := context.WithTimeout(ctx, rpcTimeout)
+	rpcCtx, cancel := context.WithTimeout(ctx, m.timeout)
 	defer cancel()
 
 	rpcCtx = m.walletKitMac.WithMacaroonAuth(rpcCtx)
@@ -321,12 +325,12 @@ func (m *walletKitClient) SendOutputs(ctx context.Context,
 func (m *walletKitClient) EstimateFee(ctx context.Context, confTarget int32) (
 	chainfee.SatPerKWeight, error) {
 
-	rpcCtx, cancel := context.WithTimeout(ctx, rpcTimeout)
+	rpcCtx, cancel := context.WithTimeout(ctx, m.timeout)
 	defer cancel()
 
 	rpcCtx = m.walletKitMac.WithMacaroonAuth(rpcCtx)
 	resp, err := m.client.EstimateFee(rpcCtx, &walletrpc.EstimateFeeRequest{
-		ConfTarget: int32(confTarget),
+		ConfTarget: confTarget,
 	})
 	if err != nil {
 		return 0, err
@@ -339,7 +343,7 @@ func (m *walletKitClient) EstimateFee(ctx context.Context, confTarget int32) (
 // Note that this function only looks up transaction ids (Verbose=false), and
 // does not query our wallet for the full set of transactions.
 func (m *walletKitClient) ListSweeps(ctx context.Context) ([]string, error) {
-	rpcCtx, cancel := context.WithTimeout(ctx, rpcTimeout)
+	rpcCtx, cancel := context.WithTimeout(ctx, m.timeout)
 	defer cancel()
 
 	resp, err := m.client.ListSweeps(
@@ -366,7 +370,7 @@ func (m *walletKitClient) ListSweeps(ctx context.Context) ([]string, error) {
 func (m *walletKitClient) BumpFee(ctx context.Context, op wire.OutPoint,
 	feeRate chainfee.SatPerKWeight) error {
 
-	rpcCtx, cancel := context.WithTimeout(ctx, rpcTimeout)
+	rpcCtx, cancel := context.WithTimeout(ctx, m.timeout)
 	defer cancel()
 
 	_, err := m.client.BumpFee(

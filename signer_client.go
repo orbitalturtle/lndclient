@@ -2,6 +2,7 @@ package lndclient
 
 import (
 	"context"
+	"time"
 
 	"github.com/btcsuite/btcd/btcec"
 	"github.com/btcsuite/btcd/txscript"
@@ -110,14 +111,16 @@ type SignDescriptor struct {
 type signerClient struct {
 	client    signrpc.SignerClient
 	signerMac serializedMacaroon
+	timeout   time.Duration
 }
 
-func newSignerClient(conn *grpc.ClientConn,
-	signerMac serializedMacaroon) *signerClient {
+func newSignerClient(conn grpc.ClientConnInterface,
+	signerMac serializedMacaroon, timeout time.Duration) *signerClient {
 
 	return &signerClient{
 		client:    signrpc.NewSignerClient(conn),
 		signerMac: signerMac,
+		timeout:   timeout,
 	}
 }
 
@@ -175,7 +178,7 @@ func (s *signerClient) SignOutputRaw(ctx context.Context, tx *wire.MsgTx,
 	}
 	rpcSignDescs := marshallSignDescriptors(signDescriptors)
 
-	rpcCtx, cancel := context.WithTimeout(ctx, rpcTimeout)
+	rpcCtx, cancel := context.WithTimeout(ctx, s.timeout)
 	defer cancel()
 
 	rpcCtx = s.signerMac.WithMacaroonAuth(rpcCtx)
@@ -205,7 +208,7 @@ func (s *signerClient) ComputeInputScript(ctx context.Context, tx *wire.MsgTx,
 	}
 	rpcSignDescs := marshallSignDescriptors(signDescriptors)
 
-	rpcCtx, cancel := context.WithTimeout(ctx, rpcTimeout)
+	rpcCtx, cancel := context.WithTimeout(ctx, s.timeout)
 	defer cancel()
 
 	rpcCtx = s.signerMac.WithMacaroonAuth(rpcCtx)
@@ -235,7 +238,7 @@ func (s *signerClient) ComputeInputScript(ctx context.Context, tx *wire.MsgTx,
 func (s *signerClient) SignMessage(ctx context.Context, msg []byte,
 	locator keychain.KeyLocator) ([]byte, error) {
 
-	rpcCtx, cancel := context.WithTimeout(ctx, rpcTimeout)
+	rpcCtx, cancel := context.WithTimeout(ctx, s.timeout)
 	defer cancel()
 
 	rpcIn := &signrpc.SignMessageReq{
@@ -260,7 +263,7 @@ func (s *signerClient) SignMessage(ctx context.Context, msg []byte,
 func (s *signerClient) VerifyMessage(ctx context.Context, msg, sig []byte,
 	pubkey [33]byte) (bool, error) {
 
-	rpcCtx, cancel := context.WithTimeout(ctx, rpcTimeout)
+	rpcCtx, cancel := context.WithTimeout(ctx, s.timeout)
 	defer cancel()
 
 	rpcIn := &signrpc.VerifyMessageReq{
@@ -289,7 +292,7 @@ func (s *signerClient) DeriveSharedKey(ctx context.Context,
 	ephemeralPubKey *btcec.PublicKey,
 	keyLocator *keychain.KeyLocator) ([32]byte, error) {
 
-	rpcCtx, cancel := context.WithTimeout(ctx, rpcTimeout)
+	rpcCtx, cancel := context.WithTimeout(ctx, s.timeout)
 	defer cancel()
 
 	rpcIn := &signrpc.SharedKeyRequest{

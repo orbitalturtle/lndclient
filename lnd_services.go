@@ -2,10 +2,15 @@ package lndclient
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"net"
+	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/btcsuite/btcd/chaincfg"
@@ -21,15 +26,12 @@ import (
 )
 
 var (
-	rpcTimeout = 30 * time.Second
+	// defaultRPCTimeout is the default timeout used for rpc calls.
+	defaultRPCTimeout = 30 * time.Second
 
 	// chainSyncPollInterval is the interval in which we poll the GetInfo
 	// call to find out if lnd is fully synced to its chain backend.
 	chainSyncPollInterval = 5 * time.Second
-
-	// defaultUnlockedInterval is the default amount of time we wait between
-	// checks that the wallet is unlocked.
-	defaultUnlockedInterval = 5 * time.Second
 
 	// minimalCompatibleVersion is the minimum version and build tags
 	// required in lnd to get all functionality implemented in lndclient.
@@ -39,7 +41,7 @@ var (
 	// back version if none is specified in the configuration.
 	minimalCompatibleVersion = &verrpc.Version{
 		AppMajor:  0,
-		AppMinor:  11,
+		AppMinor:  13,
 		AppPatch:  0,
 		BuildTags: DefaultBuildTags,
 	}
@@ -64,6 +66,16 @@ var (
 	DefaultBuildTags = []string{
 		"signrpc", "walletrpc", "chainrpc", "invoicesrpc",
 	}
+
+	// lnd13UnlockErrors is the list of errors that lnd 0.13 and later
+	// returns when the wallet is locked or not ready yet.
+	lnd13UnlockErrors = []string{
+		"waiting to start, RPC services not available",
+		"wallet not created, create one to enable full RPC access",
+		"wallet locked, unlock it to enable full RPC access",
+		"the RPC server is in the process of starting up, but not " +
+			"yet ready to accept calls",
+	}
 )
 
 // LndServicesConfig holds all configuration settings that are needed to connect
@@ -77,15 +89,35 @@ type LndServicesConfig struct {
 	Network Network
 
 	// MacaroonDir is the directory where all lnd macaroons can be found.
-	// Either this or CustomMacaroonPath can be specified but not both.
+	// Either this, CustomMacaroonPath, or CustomMacaroonHex should be set,
+	// but only one of them, depending on macaroon preferences.
 	MacaroonDir string
 
 	// CustomMacaroonPath is the full path to a custom macaroon file. Either
-	// this or MacaroonDir can be specified but not both.
+	// this, MacaroonDir, or CustomMacaroonHex should be set, but only one
+	// of them.
 	CustomMacaroonPath string
 
-	// TLSPath is the path to lnd's TLS certificate file.
+	// CustomMacaroonHex is a hexadecimal encoded macaroon string. Either
+	// this, MacaroonDir, or CustomMacaroonPath should be set, but only
+	// one of them.
+	CustomMacaroonHex string
+
+	// TLSPath is the path to lnd's TLS certificate file. Only this or
+	// TLSData can be set, not both.
 	TLSPath string
+
+	// TLSData holds the TLS certificate data. Only this or TLSPath can be
+	// set, not both.
+	TLSData string
+
+	// Insecure can be checked if we don't need to use tls, such as if
+	// we're connecting to lnd via a bufconn, then we'll skip verification.
+	Insecure bool
+
+	// SystemCert specifies whether we'll fallback to a system cert pool
+	// for tls.
+	SystemCert bool
 
 	// CheckVersion is the minimum version the connected lnd node needs to
 	// be in order to be compatible. The node will be checked against this
@@ -107,12 +139,6 @@ type LndServicesConfig struct {
 	// block until lnd is unlocked.
 	BlockUntilUnlocked bool
 
-	// UnlockInterval sets the interval at which we will query lnd to
-	// determine whether lnd is unlocked when BlockUntilUnlocked is true.
-	// This value is optional, and will be replaced with a default if it is
-	// zero.
-	UnlockInterval time.Duration
-
 	// CallerCtx is an optional context that can be passed if the caller
 	// would like to be able to cancel the long waits involved in starting
 	// up the client, such as waiting for chain sync to complete when
@@ -121,6 +147,11 @@ type LndServicesConfig struct {
 	// passed in and its Done() channel sends a message, these waits will
 	// be aborted. This allows a client to still be shut down properly.
 	CallerCtx context.Context
+
+	// RPCTimeout is an optional custom timeout that will be used for rpc
+	// calls to lnd. If this value is not set, it will default to 30
+	// seconds.
+	RPCTimeout time.Duration
 }
 
 // DialerFunc is a function that is used as grpc.WithContextDialer().
@@ -135,13 +166,14 @@ type LndServices struct {
 	Invoices      InvoicesClient
 	Router        RouterClient
 	Versioner     VersionerClient
+	State         StateClient
 
 	ChainParams *chaincfg.Params
 	NodeAlias   string
 	NodePubkey  route.Vertex
 	Version     *verrpc.Version
 
-	macaroons *macaroonPouch
+	macaroons macaroonPouch
 }
 
 // GrpcLndServices constitutes a set of required RPC services.
@@ -165,12 +197,24 @@ func NewLndServices(cfg *LndServicesConfig) (*GrpcLndServices, error) {
 		cfg.CheckVersion = minimalCompatibleVersion
 	}
 
-	// We don't allow setting both the macaroon directory and the custom
-	// macaroon path. If both are empty, that's fine, the default behavior
-	// is to use lnd's default directory to try to locate the macaroons.
-	if cfg.MacaroonDir != "" && cfg.CustomMacaroonPath != "" {
-		return nil, fmt.Errorf("must set either MacaroonDir or " +
-			"CustomMacaroonPath but not both")
+	// Of the macaroon directory, the custom macaroon path, and the custom
+	// macaroon hex, we only allow one to be set at once. If all are empty,
+	// that's fine, the default behavior is to use lnd's default directory
+	// to try to locate the macaroons.
+	macaroonOptions := []string{
+		cfg.MacaroonDir,
+		cfg.CustomMacaroonPath,
+		cfg.CustomMacaroonHex,
+	}
+	macOptionCount := 0
+	for _, option := range macaroonOptions {
+		if option != "" {
+			macOptionCount++
+		}
+	}
+	if macOptionCount > 1 {
+		return nil, fmt.Errorf("must set only one: MacaroonDir, " +
+			"CustomMacaroonPath, or CustomMacaroonHex")
 	}
 
 	// Based on the network, if the macaroon directory isn't set, then
@@ -228,12 +272,26 @@ func NewLndServices(cfg *LndServicesConfig) (*GrpcLndServices, error) {
 	// macaroon. We don't use the pouch yet because if not all subservers
 	// are enabled, then not all macaroons might be there and the user would
 	// get a more cryptic error message.
-	readonlyMac, err := loadMacaroon(
-		macaroonDir, defaultReadonlyFilename, cfg.CustomMacaroonPath,
-	)
-	if err != nil {
-		return nil, err
+	var readonlyMac serializedMacaroon
+	if cfg.CustomMacaroonHex != "" {
+		readonlyMac = serializedMacaroon(cfg.CustomMacaroonHex)
+	} else {
+		readonlyMac, err = loadMacaroon(
+			macaroonDir, readonlyMacFilename, cfg.CustomMacaroonPath,
+		)
+		if err != nil {
+			return nil, err
+		}
 	}
+
+	timeout := defaultRPCTimeout
+	if cfg.RPCTimeout != 0 {
+		timeout = cfg.RPCTimeout
+	}
+
+	basicClient := lnrpc.NewLightningClient(conn)
+	stateClient := newStateClient(conn, readonlyMac)
+	versionerClient := newVersionerClient(conn, readonlyMac, timeout)
 
 	cleanupConn := func() {
 		closeErr := conn.Close()
@@ -244,8 +302,8 @@ func NewLndServices(cfg *LndServicesConfig) (*GrpcLndServices, error) {
 
 	// Get lnd's info, blocking until lnd is unlocked if required.
 	info, err := getLndInfo(
-		cfg.CallerCtx, lnrpc.NewLightningClient(conn), readonlyMac,
-		cfg.BlockUntilUnlocked, cfg.UnlockInterval,
+		cfg.CallerCtx, basicClient, readonlyMac, stateClient,
+		cfg.BlockUntilUnlocked,
 	)
 	if err != nil {
 		cleanupConn()
@@ -253,7 +311,7 @@ func NewLndServices(cfg *LndServicesConfig) (*GrpcLndServices, error) {
 	}
 
 	nodeAlias, nodeKey, version, err := checkLndCompatibility(
-		conn, readonlyMac, info, cfg.Network, cfg.CheckVersion,
+		conn, readonlyMac, info, cfg.Network, cfg.CheckVersion, timeout,
 	)
 	if err != nil {
 		cleanupConn()
@@ -262,7 +320,9 @@ func NewLndServices(cfg *LndServicesConfig) (*GrpcLndServices, error) {
 
 	// Now that we've ensured our macaroon directory is set properly, we
 	// can retrieve our full macaroon pouch from the directory.
-	macaroons, err := newMacaroonPouch(macaroonDir, cfg.CustomMacaroonPath)
+	macaroons, err := newMacaroonPouch(
+		macaroonDir, cfg.CustomMacaroonPath, cfg.CustomMacaroonHex,
+	)
 	if err != nil {
 		cleanupConn()
 		return nil, fmt.Errorf("unable to obtain macaroons: %v", err)
@@ -271,17 +331,26 @@ func NewLndServices(cfg *LndServicesConfig) (*GrpcLndServices, error) {
 	// With the macaroons loaded and the version checked, we can now create
 	// the real lightning client which uses the admin macaroon.
 	lightningClient := newLightningClient(
-		conn, chainParams, macaroons.adminMac,
+		conn, timeout, chainParams, macaroons[adminMacFilename],
 	)
 
 	// With the network check passed, we'll now initialize the rest of the
 	// sub-server connections, giving each of them their specific macaroon.
-	notifierClient := newChainNotifierClient(conn, macaroons.chainMac)
-	signerClient := newSignerClient(conn, macaroons.signerMac)
-	walletKitClient := newWalletKitClient(conn, macaroons.walletKitMac)
-	invoicesClient := newInvoicesClient(conn, macaroons.invoiceMac)
-	routerClient := newRouterClient(conn, macaroons.routerMac)
-	versionerClient := newVersionerClient(conn, macaroons.readonlyMac)
+	notifierClient := newChainNotifierClient(
+		conn, macaroons[chainMacFilename], timeout,
+	)
+	signerClient := newSignerClient(
+		conn, macaroons[signerMacFilename], timeout,
+	)
+	walletKitClient := newWalletKitClient(
+		conn, macaroons[walletKitMacFilename], timeout,
+	)
+	invoicesClient := newInvoicesClient(
+		conn, macaroons[invoiceMacFilename], timeout,
+	)
+	routerClient := newRouterClient(
+		conn, macaroons[routerMacFilename], timeout,
+	)
 
 	cleanup := func() {
 		log.Debugf("Closing lnd connection")
@@ -295,6 +364,9 @@ func NewLndServices(cfg *LndServicesConfig) (*GrpcLndServices, error) {
 
 		log.Debugf("Wait for invoices to finish")
 		invoicesClient.WaitForFinished()
+
+		log.Debugf("Wait for router to finish")
+		routerClient.WaitForFinished()
 
 		log.Debugf("Lnd services finished")
 	}
@@ -327,7 +399,7 @@ func NewLndServices(cfg *LndServicesConfig) (*GrpcLndServices, error) {
 		log.Infof("Waiting for lnd to be fully synced to its chain " +
 			"backend, this might take a while")
 
-		err := services.waitForChainSync(cfg.CallerCtx)
+		err := services.waitForChainSync(cfg.CallerCtx, timeout)
 		if err != nil {
 			cleanup()
 			return nil, fmt.Errorf("error waiting for chain to "+
@@ -351,7 +423,9 @@ func (s *GrpcLndServices) Close() {
 // waitForChainSync waits and blocks until the connected lnd node is fully
 // synced to its chain backend. This could theoretically take hours if the
 // initial block download is still in progress.
-func (s *GrpcLndServices) waitForChainSync(ctx context.Context) error {
+func (s *GrpcLndServices) waitForChainSync(ctx context.Context,
+	timeout time.Duration) error {
+
 	mainCtx := ctx
 	if mainCtx == nil {
 		mainCtx = context.Background()
@@ -367,7 +441,7 @@ func (s *GrpcLndServices) waitForChainSync(ctx context.Context) error {
 			// too long, that can be a sign of something being wrong
 			// with the node. That's why we don't wait any longer
 			// than a few seconds for each individual GetInfo call.
-			ctxt, cancel := context.WithTimeout(mainCtx, rpcTimeout)
+			ctxt, cancel := context.WithTimeout(mainCtx, timeout)
 			info, err := s.Client.GetInfo(ctxt)
 			if err != nil {
 				cancel()
@@ -405,85 +479,133 @@ func (s *GrpcLndServices) waitForChainSync(ctx context.Context) error {
 // and back off if the failure is due to lnd currently being locked. Otherwise,
 // it will fail fast on any errors returned. We use the raw ln client so that
 // we can set specific grpc options we need to wait for lnd to be ready.
-func getLndInfo(ctx context.Context, ln lnrpc.LightningClient,
-	readonlyMac serializedMacaroon, waitForUnlocked bool,
-	waitInterval time.Duration) (*Info, error) {
-
-	if waitInterval == 0 {
-		waitInterval = defaultUnlockedInterval
-	}
+func getLndInfo(ctx context.Context, basicClient lnrpc.LightningClient,
+	readonlyMac serializedMacaroon, stateClient StateClient,
+	waitForUnlocked bool) (*Info, error) {
 
 	if ctx == nil {
 		ctx = context.Background()
 	}
 
-	if waitForUnlocked {
-		log.Info("Waiting for lnd to unlock")
+	// We expect the initial connection to already have succeeded. So we
+	// know lnd is responding. Therefore we can now just subscribe to the
+	// state update RPC. With the new unified unlocker RPC the server
+	// shouldn't shut down/close on us during the unlocking phase.
+	//
+	// All we have to do is to interpret the states that lnd could be in
+	// during the unlock:
+	// Locked: lnd is currently locked or no wallet exist
+	//   -> WalletStateNonExisting, WalletStateLocked
+	// Unlocking: lnd has just been unlocked, -> WalletStateUnlocked
+	// Unlocked, ok: lnd is unlocked and ready
+	//   -> WalletStateRPCActive
+	// Unlocked, not ok: lnd is unlocked but in bad state, err
+	stateChan, errChan, err := stateClient.SubscribeState(ctx)
+	if err != nil {
+		// Because we're expecting lnd to be at least version 0.13 here
+		// we would get an "Unimplemented" error here if it's a previous
+		// version and the node is locked. Since the actual version
+		// compatibility check only runs after this check, we want to
+		// print at least a somewhat useful error message here.
+		if IsUnlockError(err) {
+			err = fmt.Errorf("lnd version incompatible, need "+
+				"at least v0.13.0-beta, got error on "+
+				"state subscription: %w", err)
+		}
+
+		return nil, fmt.Errorf("error subscribing to lnd wallet "+
+			"state: %w", err)
 	}
 
-	for {
-		// There are a few states that lnd could be in here:
-		// Down: lnd is not listening for requests, err Unavailable
-		// Locked: lnd is currently locked, err Unimplemented
-		// Unlocking: lnd has just been unlocked, err Unavailable
-		// Unlocked, ok: lnd is unlocked, no error
-		// Unlocked, not ok: lnd is unlocked but in bad state, err
-		//
-		// We call getinfo with our WaitForReady option, which waits
-		// for temporary errors (such as the error we get when lnd is
-		// unlocking) to resolve, but will timeout on permanent errors
-		// (such as lnd being permanently down). We use our wait
-		// interval as a deadline for our context so that we will fail
-		// within that period when lnd is down.
-		rpcCtx, cancel := context.WithTimeout(ctx, waitInterval)
-		info, err := ln.GetInfo(
-			readonlyMac.WithMacaroonAuth(rpcCtx),
+	getInfo := func() (*Info, error) {
+		// We've made a connection and (possibly) unlocked lnd. All that
+		// is left to do is to query and return the node information.
+		info, err := basicClient.GetInfo(
+			readonlyMac.WithMacaroonAuth(ctx),
 			&lnrpc.GetInfoRequest{},
-			grpc.WaitForReady(waitForUnlocked),
 		)
-		cancel()
-		if err == nil {
-			return newInfo(info)
-		}
-
-		// If we do not want to wait for lnd to be unlocked, we just
-		// fail immediately on any error.
-		if !waitForUnlocked {
+		if err != nil {
 			return nil, err
 		}
 
-		// If we do not get a rpc error code, something else is wrong
-		// with the call, so we fail.
-		rpcErrorCode, ok := status.FromError(err)
-		if !ok {
-			return nil, err
-		}
+		return newInfo(info)
+	}
 
-		// If we did not get an unimplemented error, indicating that
-		// lnd is locked, we fail because something else is wrong, and
-		// we expect our wait until ready to catch race conditions where
-		// the server is in the process of unlocking.
-		if rpcErrorCode.Code() != codes.Unimplemented {
-			return nil, err
-		}
+	// If we don't want to wait for the unlock we exit the function early
+	// and will try to return the node info below. This could fail if the
+	// node is indeed still locked so this flag doesn't make a lot of sense
+	// anymore...
+	if !waitForUnlocked {
+		return getInfo()
+	}
 
-		// At this point, we know lnd is locked, so we wait for our
-		// interval, exiting if context is cancelled.
+	// If we do want to wait for the unlock, we need to consume the state
+	// updates now.
+	log.Info("Waiting for lnd to unlock")
+	for {
 		select {
+		case state := <-stateChan:
+			log.Infof("Wallet state of lnd is now: %v", state)
+
+			// Once we reach the final state we can break out of the
+			// loop.
+			if state == WalletStateRPCActive {
+				return getInfo()
+			}
+
+		case err := <-errChan:
+			log.Errorf("Error while waiting for lnd to be "+
+				"unlocked: %v", err)
+			return nil, err
+
 		case <-ctx.Done():
 			return nil, ctx.Err()
-
-		case <-time.After(waitInterval):
 		}
 	}
+}
+
+// IsUnlockError returns true if the given error is one that lnd returns when
+// its wallet is locked, either before version 0.13 or after.
+func IsUnlockError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	// Is the error one that lnd 0.13 returns when it's locked?
+	errStr := err.Error()
+	for _, lnd13Err := range lnd13UnlockErrors {
+		if strings.Contains(errStr, lnd13Err) {
+			return true
+		}
+	}
+
+	// If we do not get a rpc error code, something else is wrong with the
+	// call, so we fail.
+	rpcErrorCode, ok := status.FromError(err)
+	if !ok {
+		return false
+	}
+
+	// Unimplemented means we're hitting the GetInfo RPC while the wallet
+	// unlocker RPC is still up. Unavailable can be returned in the short
+	// window of time while the unlocker shuts down and the main RPC server
+	// is started.
+	if rpcErrorCode.Code() == codes.Unimplemented ||
+		rpcErrorCode.Code() == codes.Unavailable {
+
+		return true
+	}
+
+	return false
 }
 
 // checkLndCompatibility makes sure the connected lnd instance is running on the
 // correct network, has the version RPC implemented, is the correct minimal
 // version and supports all required build tags/subservers.
-func checkLndCompatibility(conn *grpc.ClientConn,
+func checkLndCompatibility(conn grpc.ClientConnInterface,
 	readonlyMac serializedMacaroon, info *Info, network Network,
-	minVersion *verrpc.Version) (string, [33]byte, *verrpc.Version, error) {
+	minVersion *verrpc.Version, timeout time.Duration) (string,
+	[33]byte, *verrpc.Version, error) {
 
 	// onErr is a closure that simplifies returning multiple values in the
 	// error case.
@@ -509,7 +631,7 @@ func checkLndCompatibility(conn *grpc.ClientConn,
 
 	// We use our own clients with a readonly macaroon here, because we know
 	// that's all we need for the checks.
-	versionerClient := newVersionerClient(conn, readonlyMac)
+	versionerClient := newVersionerClient(conn, readonlyMac, timeout)
 
 	// Now let's also check the version of the connected lnd node.
 	version, err := checkVersionCompatibility(versionerClient, minVersion)
@@ -620,13 +742,13 @@ var (
 	defaultDataDir     = "data"
 	defaultChainSubDir = "chain"
 
-	defaultAdminMacaroonFilename     = "admin.macaroon"
-	defaultInvoiceMacaroonFilename   = "invoices.macaroon"
-	defaultChainMacaroonFilename     = "chainnotifier.macaroon"
-	defaultWalletKitMacaroonFilename = "walletkit.macaroon"
-	defaultRouterMacaroonFilename    = "router.macaroon"
-	defaultSignerFilename            = "signer.macaroon"
-	defaultReadonlyFilename          = "readonly.macaroon"
+	adminMacFilename     = "admin.macaroon"
+	invoiceMacFilename   = "invoices.macaroon"
+	chainMacFilename     = "chainnotifier.macaroon"
+	walletKitMacFilename = "walletkit.macaroon"
+	routerMacFilename    = "router.macaroon"
+	signerMacFilename    = "signer.macaroon"
+	readonlyMacFilename  = "readonly.macaroon"
 
 	// maxMsgRecvSize is the largest gRPC message our client will receive.
 	// We set this to 200MiB.
@@ -634,17 +756,11 @@ var (
 )
 
 func getClientConn(cfg *LndServicesConfig) (*grpc.ClientConn, error) {
-
-	// Load the specified TLS certificate and build transport credentials
-	// with it.
-	tlsPath := cfg.TLSPath
-	if tlsPath == "" {
-		tlsPath = defaultTLSCertPath
-	}
-
-	creds, err := credentials.NewClientTLSFromFile(tlsPath, "")
+	creds, err := GetTLSCredentials(
+		cfg.TLSData, cfg.TLSPath, cfg.Insecure, cfg.SystemCert,
+	)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("unable to get tls creds: %v", err)
 	}
 
 	// Create a dial options array.
@@ -664,4 +780,79 @@ func getClientConn(cfg *LndServicesConfig) (*grpc.ClientConn, error) {
 	}
 
 	return conn, nil
+}
+
+// GetTLSCredentials gets the tls credentials, whether provided as straight-up
+// data or a path to a certificate file.
+func GetTLSCredentials(tlsData, tlsPath string, insecure, systemCert bool) (
+	credentials.TransportCredentials, error) {
+
+	if tlsPath != "" && tlsData != "" {
+		return nil, fmt.Errorf("must set only one: TLSPath or TLSData")
+	}
+
+	var creds credentials.TransportCredentials
+	var err error
+
+	// We'll determine if the tls certificate is passed in directly as
+	// data, by a path, or try the system's certificate chain, and then
+	// load it.
+	switch {
+	case insecure:
+		// If we don't need to use tls, such as if we're connecting to
+		// lnd via a bufconn, then we'll skip verification.
+		creds = credentials.NewTLS(&tls.Config{
+			InsecureSkipVerify: true, // nolint:gosec
+		})
+
+	case systemCert:
+		// Fallback to the system pool. Using an empty tls config is an
+		// alternative to x509.SystemCertPool(), which is not supported
+		// on Windows.
+		creds = credentials.NewTLS(&tls.Config{})
+
+	case tlsData != "":
+		tlsBytes := []byte(tlsData)
+
+		block, _ := pem.Decode(tlsBytes)
+		if block == nil || block.Type != "CERTIFICATE" {
+			return nil, errors.New("failed to decode PEM block " +
+				"containing tls certificate")
+		}
+
+		cert, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			return nil, err
+		}
+
+		pool := x509.NewCertPool()
+		pool.AddCert(cert)
+
+		// Load the specified TLS certificate and build transport
+		// credentials.
+		creds = credentials.NewClientTLSFromCert(pool, "")
+
+	case tlsPath != "":
+		creds, err = credentials.NewClientTLSFromFile(tlsPath, "")
+		if err != nil {
+			return nil, err
+		}
+
+	default:
+		// If neither tlsData nor tlsPath were set, we'll try the default
+		// lnd tls cert path.
+		if _, err := os.Stat(defaultTLSCertPath); err == nil {
+			creds, err = credentials.NewClientTLSFromFile(
+				defaultTLSCertPath, "",
+			)
+			if err != nil {
+				return nil, err
+			}
+
+		} else {
+			return nil, err
+		}
+	}
+
+	return creds, err
 }

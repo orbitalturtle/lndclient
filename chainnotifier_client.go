@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/wire"
@@ -29,14 +30,18 @@ type ChainNotifierClient interface {
 type chainNotifierClient struct {
 	client   chainrpc.ChainNotifierClient
 	chainMac serializedMacaroon
+	timeout  time.Duration
 
 	wg sync.WaitGroup
 }
 
-func newChainNotifierClient(conn *grpc.ClientConn, chainMac serializedMacaroon) *chainNotifierClient {
+func newChainNotifierClient(conn grpc.ClientConnInterface,
+	chainMac serializedMacaroon, timeout time.Duration) *chainNotifierClient {
+
 	return &chainNotifierClient{
 		client:   chainrpc.NewChainNotifierClient(conn),
 		chainMac: chainMac,
+		timeout:  timeout,
 	}
 }
 
@@ -106,8 +111,8 @@ func (s *chainNotifierClient) RegisterSpendNtfn(ctx context.Context,
 				return
 			}
 
-			switch c := spendEvent.Event.(type) {
-			case *chainrpc.SpendEvent_Spend:
+			c, ok := spendEvent.Event.(*chainrpc.SpendEvent_Spend)
+			if ok {
 				err := processSpendDetail(c.Spend)
 				if err != nil {
 					errChan <- err

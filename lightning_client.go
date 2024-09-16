@@ -56,7 +56,7 @@ type LightningClient interface {
 		endHeight int32) ([]Transaction, error)
 
 	// ListChannels retrieves all channels of the backing lnd node.
-	ListChannels(ctx context.Context) ([]ChannelInfo, error)
+	ListChannels(ctx context.Context, activeOnly, publicOnly bool) ([]ChannelInfo, error)
 
 	// PendingChannels returns a list of lnd's pending channels.
 	PendingChannels(ctx context.Context) (*PendingChannels, error)
@@ -121,7 +121,7 @@ type LightningClient interface {
 
 	// GetChanInfo returns the channel info for the passed channel,
 	// including the routing policy for both end.
-	GetChanInfo(ctx context.Context, chanId uint64) (*ChannelEdge, error)
+	GetChanInfo(ctx context.Context, chanID uint64) (*ChannelEdge, error)
 
 	// ListPeers gets a list the peers we are currently connected to.
 	ListPeers(ctx context.Context) ([]Peer, error)
@@ -163,6 +163,30 @@ type LightningClient interface {
 	// of newly added/settled invoices.
 	SubscribeInvoices(ctx context.Context, req InvoiceSubscriptionRequest) (
 		<-chan *Invoice, <-chan error, error)
+
+	// ListPermissions returns a list of all RPC method URIs and the
+	// macaroon permissions that are required to access them.
+	ListPermissions(ctx context.Context) (map[string][]MacaroonPermission,
+		error)
+
+	// ChannelAcceptor create a channel acceptor using the accept function
+	// passed in. The timeout provided will be used to timeout the passed
+	// accept closure when it exceeds the amount of time we allow. Note that
+	// this amount should be strictly less than lnd's chanacceptor timeout
+	// parameter.
+	ChannelAcceptor(ctx context.Context, timeout time.Duration,
+		accept AcceptorFunction) (chan error, error)
+
+	// QueryRoutes can query LND to return a route (with fees) between two
+	// vertices.
+	QueryRoutes(ctx context.Context, req QueryRoutesRequest) (
+		*QueryRoutesResponse, error)
+
+	// CheckMacaroonPermissions allows a client to check the validity of a
+	// macaroon.
+	CheckMacaroonPermissions(ctx context.Context, macaroon []byte,
+		permissions []MacaroonPermission, fullMethod string) (bool,
+		error)
 }
 
 // Info contains info about the connected lnd node.
@@ -283,9 +307,14 @@ type ChannelInfo struct {
 
 	// RemoteConstraints is the set of constraints for the remote node.
 	RemoteConstraints *ChannelConstraints
+
+	// CloseAddr is the optional upfront shutdown address set for a
+	// channel.
+	CloseAddr btcutil.Address
 }
 
-func newChannelInfo(channel *lnrpc.Channel) (*ChannelInfo, error) {
+func (s *lightningClient) newChannelInfo(channel *lnrpc.Channel) (*ChannelInfo,
+	error) {
 	remoteVertex, err := route.NewVertexFromStr(channel.RemotePubkey)
 	if err != nil {
 		return nil, err
@@ -324,10 +353,21 @@ func newChannelInfo(channel *lnrpc.Channel) (*ChannelInfo, error) {
 	}
 
 	chanInfo.PendingHtlcs = make([]PendingHtlc, len(channel.PendingHtlcs))
-	for i, htlc := range channel.PendingHtlcs {
-		chanInfo.PendingHtlcs[i] = PendingHtlc{
-			Incoming: htlc.Incoming,
-			Amount:   btcutil.Amount(htlc.Amount),
+	for i, rpcHtlc := range channel.PendingHtlcs {
+		htlc, err := newPendingHtlc(rpcHtlc)
+		if err != nil {
+			return nil, err
+		}
+
+		chanInfo.PendingHtlcs[i] = *htlc
+	}
+
+	if channel.CloseAddress != "" {
+		chanInfo.CloseAddr, err = btcutil.DecodeAddress(
+			channel.CloseAddress, s.params,
+		)
+		if err != nil {
+			return nil, err
 		}
 	}
 
@@ -706,8 +746,8 @@ type NodeUpdate struct {
 	// IdentityKey holds the node's pub key.
 	IdentityKey route.Vertex
 
-	// GlobalFeatures holds the node's advertised features.
-	GlobalFeatures lnwire.FeatureVector
+	// Features is the set of features the node supports.
+	Features []lnwire.FeatureBit
 
 	// Alias is the node's alias name.
 	Alias string
@@ -801,16 +841,199 @@ type NetworkInfo struct {
 	NumZombieChans uint64
 }
 
-var (
-	// ErrMalformedServerResponse is returned when the swap and/or prepay
-	// invoice is malformed.
-	ErrMalformedServerResponse = errors.New(
-		"one or more invoices are malformed",
-	)
+// AcceptorRequest contains the details of an incoming channel that has been
+// proposed to our node.
+type AcceptorRequest struct {
+	// NodePubkey is the pubkey of the node that wishes to open an inbound
+	// channel.
+	NodePubkey route.Vertex
 
-	// ErrNoRouteToServer is returned if no quote can returned because there
-	// is no route to the server.
-	ErrNoRouteToServer = errors.New("no off-chain route to server")
+	// ChainHash is the hash of the genesis block of the relevant chain.
+	ChainHash []byte
+
+	// PendingChanID is the pending channel ID for the channel.
+	PendingChanID [32]byte
+
+	// FundingAmt is the total funding amount.
+	FundingAmt btcutil.Amount
+
+	// PushAmt is the amount pushed by the party pushing the channel.
+	PushAmt btcutil.Amount
+
+	// The dust limit of the initiator's commitment tx.
+	DustLimit btcutil.Amount
+
+	// MaxValueInFlight is the maximum msat amount that can be pending in the
+	// channel.
+	MaxValueInFlight btcutil.Amount
+
+	// ChannelReserve is the minimum amount of satoshis the initiator requires
+	// us to have at all times.
+	ChannelReserve btcutil.Amount
+
+	// MinHtlc is the smallest HTLC in millisatoshis that the initiator will
+	// accept.
+	MinHtlc lnwire.MilliSatoshi
+
+	// FeePerKw is the initial fee rate that the initiator suggests for both
+	// commitment transactions.
+	FeePerKw chainfee.SatPerKWeight
+
+	// CsvDelay is the number of blocks to use for the relative time lock in
+	// the pay-to-self output of both commitment transactions.
+	CsvDelay uint32
+
+	// MaxAcceptedHtlcs is the total number of incoming HTLC's that the
+	// initiator will accept.
+	MaxAcceptedHtlcs uint32
+
+	// ChannelFlags is a bit-field which the initiator uses to specify proposed
+	// channel behavior.
+	ChannelFlags uint32
+}
+
+func newAcceptorRequest(req *lnrpc.ChannelAcceptRequest) (*AcceptorRequest,
+	error) {
+
+	pk, err := route.NewVertexFromBytes(req.NodePubkey)
+	if err != nil {
+		return nil, err
+	}
+
+	var pending [32]byte
+	copy(pending[:], req.PendingChanId)
+
+	return &AcceptorRequest{
+		NodePubkey:       pk,
+		ChainHash:        req.ChainHash,
+		PendingChanID:    pending,
+		FundingAmt:       btcutil.Amount(req.FundingAmt),
+		PushAmt:          btcutil.Amount(req.PushAmt),
+		DustLimit:        btcutil.Amount(req.DustLimit),
+		MaxValueInFlight: btcutil.Amount(req.MaxValueInFlight),
+		ChannelReserve:   btcutil.Amount(req.ChannelReserve),
+		MinHtlc:          lnwire.MilliSatoshi(req.MinHtlc),
+		FeePerKw:         chainfee.SatPerKWeight(req.FeePerKw),
+		CsvDelay:         req.CsvDelay,
+		MaxAcceptedHtlcs: req.MaxAcceptedHtlcs,
+		ChannelFlags:     req.ChannelFlags,
+	}, nil
+}
+
+// AcceptorResponse contains the response to a channel acceptor request.
+type AcceptorResponse struct {
+	// Accept indicates whether to accept the channel.
+	Accept bool
+
+	// Error is an optional error to send the initiating party to indicate
+	// why the channel was rejected. This string will be sent to the
+	// initiating peer, and is limited to 500 chars. This field cannot be
+	// set if the accept boolean is true.
+	Error string
+
+	// UpfrontShutdown is the address to use if the initiating peer supports
+	// option upfront shutdown. Note that you must check whether the peer
+	// supports this feature if setting the address.
+	UpfrontShutdown string
+
+	// CsvDelay is the delay (in blocks) that we require for the remote party.
+	CsvDelay uint32
+
+	// ReserveSat is the amount that we require the remote peer to adhere to.
+	ReserveSat uint64
+
+	// InFlightMaxMsat is the maximum amount of funds in millisatoshis that
+	// we allow the remote peer to have in outstanding htlcs.
+	InFlightMaxMsat uint64
+
+	// MaxHtlcCount is the maximum number of htlcs that the remote peer can
+	// offer us.
+	MaxHtlcCount uint32
+
+	// MinHtlcIn is the minimum value in millisatoshis for incoming htlcs
+	// on the channel.
+	MinHtlcIn uint64
+
+	// MinAcceptDepth is the number of confirmations we require before we
+	// consider the channel open.
+	MinAcceptDepth uint32
+}
+
+// QueryRoutesRequest is the request of a QueryRoutes call.
+type QueryRoutesRequest struct {
+	// Source is the optional source vertex of the route.
+	Source *route.Vertex
+
+	// PubKey is the destination vertex.
+	PubKey route.Vertex
+
+	// LastHop is the optional last hop before the destination.
+	LastHop *route.Vertex
+
+	// RouteHints represents the different routing hints that can be used to
+	// assist the router. These hints will act as optional intermediate hops
+	// along the route.
+	RouteHints [][]zpay32.HopHint
+
+	// MaxCltv when set is used the the CLTV limit.
+	MaxCltv *uint32
+
+	// UseMissionControl if set to true, edge probabilities from mission
+	// control will be used to get the optimal route.
+	UseMissionControl bool
+
+	// AmtMsat is the amount we'd like to send along the route in
+	// millisatoshis.
+	AmtMsat lnwire.MilliSatoshi
+
+	// FeeLimitMsat is the fee limit to use in millisatoshis.
+	FeeLimitMsat lnwire.MilliSatoshi
+}
+
+// Hop holds details about a single hop along a route.
+type Hop struct {
+	// ChannelID is the short channel ID of the forwarding channel.
+	ChannelID uint64
+
+	// Expiry is the timelock value.
+	Expiry uint32
+
+	// AmtToForwardMsat is the forwarded amount for this hop.
+	AmtToForwardMsat lnwire.MilliSatoshi
+
+	// FeeMsat is the forwarding fee for this hop.
+	FeeMsat lnwire.MilliSatoshi
+
+	// PubKey is an optional public key of the hop. If the public key is
+	// given, the payment can be executed without relying on a copy of the
+	// channel graph.
+	PubKey *route.Vertex
+}
+
+// QueryRoutesResponse is the response of a QueryRoutes call.
+type QueryRoutesResponse struct {
+	// TotalTimeLock is the cumulative (final) time lock across the entire
+	// route. This is the CLTV value that should be extended to the first
+	// hop in the route. All other hops will decrement the time-lock as
+	// advertised, leaving enough time for all hops to wait for or present
+	// the payment preimage to complete the payment.
+	TotalTimeLock uint32
+
+	// Hops contains details concerning the specific forwarding details at
+	// each hop.
+	Hops []*Hop
+
+	// TotalFeesMsat is the total fees in millisatoshis.
+	TotalFeesMsat lnwire.MilliSatoshi
+
+	// TotalAmtMsat is the total amount in millisatoshis.
+	TotalAmtMsat lnwire.MilliSatoshi
+}
+
+var (
+	// ErrNoRouteFound is returned if we can't find a path with the passed
+	// parameters.
+	ErrNoRouteFound = errors.New("no route found")
 
 	// PaymentResultUnknownPaymentHash is the string result returned by
 	// SendPayment when the final node indicates the hash is unknown.
@@ -837,15 +1060,17 @@ type lightningClient struct {
 	client   lnrpc.LightningClient
 	wg       sync.WaitGroup
 	params   *chaincfg.Params
+	timeout  time.Duration
 	adminMac serializedMacaroon
 }
 
-func newLightningClient(conn *grpc.ClientConn,
+func newLightningClient(conn grpc.ClientConnInterface, timeout time.Duration,
 	params *chaincfg.Params, adminMac serializedMacaroon) *lightningClient {
 
 	return &lightningClient{
 		client:   lnrpc.NewLightningClient(conn),
 		params:   params,
+		timeout:  timeout,
 		adminMac: adminMac,
 	}
 }
@@ -866,7 +1091,7 @@ func (s *lightningClient) WaitForFinished() {
 func (s *lightningClient) WalletBalance(ctx context.Context) (
 	*WalletBalance, error) {
 
-	rpcCtx, cancel := context.WithTimeout(ctx, rpcTimeout)
+	rpcCtx, cancel := context.WithTimeout(ctx, s.timeout)
 	defer cancel()
 
 	rpcCtx = s.adminMac.WithMacaroonAuth(rpcCtx)
@@ -882,7 +1107,7 @@ func (s *lightningClient) WalletBalance(ctx context.Context) (
 }
 
 func (s *lightningClient) GetInfo(ctx context.Context) (*Info, error) {
-	rpcCtx, cancel := context.WithTimeout(ctx, rpcTimeout)
+	rpcCtx, cancel := context.WithTimeout(ctx, s.timeout)
 	defer cancel()
 
 	rpcCtx = s.adminMac.WithMacaroonAuth(rpcCtx)
@@ -923,7 +1148,7 @@ func (s *lightningClient) EstimateFeeToP2WSH(ctx context.Context,
 	amt btcutil.Amount, confTarget int32) (btcutil.Amount,
 	error) {
 
-	rpcCtx, cancel := context.WithTimeout(ctx, rpcTimeout)
+	rpcCtx, cancel := context.WithTimeout(ctx, s.timeout)
 	defer cancel()
 
 	// Generate dummy p2wsh address for fee estimation.
@@ -1036,9 +1261,9 @@ func (s *lightningClient) payInvoice(ctx context.Context, invoice string,
 					return &PaymentResult{Err: err}
 				}
 				return &PaymentResult{
-					PaidFee: btcutil.Amount(r.TotalFees),
+					PaidFee: btcutil.Amount(r.TotalFees), // nolint:staticcheck
 					PaidAmt: btcutil.Amount(
-						r.TotalAmt - r.TotalFees,
+						r.TotalAmt - r.TotalFees, // nolint:staticcheck
 					),
 					Preimage: preimage,
 				}
@@ -1089,12 +1314,12 @@ func (s *lightningClient) payInvoice(ctx context.Context, invoice string,
 func (s *lightningClient) AddInvoice(ctx context.Context,
 	in *invoicesrpc.AddInvoiceData) (lntypes.Hash, string, error) {
 
-	rpcCtx, cancel := context.WithTimeout(ctx, rpcTimeout)
+	rpcCtx, cancel := context.WithTimeout(ctx, s.timeout)
 	defer cancel()
 
 	rpcIn := &lnrpc.Invoice{
 		Memo:       in.Memo,
-		Value:      int64(in.Value.ToSatoshis()),
+		ValueMsat:  int64(in.Value),
 		Expiry:     in.Expiry,
 		CltvExpiry: in.CltvExpiry,
 		Private:    true,
@@ -1191,6 +1416,9 @@ type InvoiceHtlc struct {
 	// back).
 	ResolveTime time.Time
 
+	// State is the acceptance state of the hltc.
+	State lnrpc.InvoiceHTLCState
+
 	// CustomRecords is list of the custom tlv records.
 	CustomRecords map[uint64][]byte
 }
@@ -1202,6 +1430,44 @@ type PendingHtlc struct {
 
 	// Amount is the amount in satoshis that this HTLC represents.
 	Amount btcutil.Amount
+
+	// Hash is the payment hash for the htlc. Not guaranteed to be unique.
+	Hash lntypes.Hash
+
+	// Expiry is the height that this htlc will expire.
+	Expiry uint32
+
+	// Index identifying the htlc on the channel.
+	HtlcIndex uint64
+
+	// ForwardingChannel is the channel that the htlc was forwarded from if
+	// if is an incoming hltc, or should to forwarded to if it is an
+	// outgoing htlc. This value may be zero for htlcs that we have not made
+	// forwarding decisions for yet.
+	ForwardingChannel lnwire.ShortChannelID
+
+	// ForwardingIndex identifying the htlc on the forwarding channel. This
+	// will be zero if the htlc originated at our node.
+	ForwardingIndex uint64
+}
+
+func newPendingHtlc(rpcHtlc *lnrpc.HTLC) (*PendingHtlc, error) {
+	hash, err := lntypes.MakeHash(rpcHtlc.HashLock)
+	if err != nil {
+		return nil, err
+	}
+
+	return &PendingHtlc{
+		Incoming:  rpcHtlc.Incoming,
+		Amount:    btcutil.Amount(rpcHtlc.Amount),
+		Hash:      hash,
+		Expiry:    rpcHtlc.ExpirationHeight,
+		HtlcIndex: rpcHtlc.HtlcIndex,
+		ForwardingChannel: lnwire.NewShortChanIDFromInt(
+			rpcHtlc.ForwardingChannel,
+		),
+		ForwardingIndex: rpcHtlc.ForwardingHtlcIndex,
+	}, nil
 }
 
 // LookupInvoice looks up an invoice in lnd, it will error if the invoice is
@@ -1209,7 +1475,7 @@ type PendingHtlc struct {
 func (s *lightningClient) LookupInvoice(ctx context.Context,
 	hash lntypes.Hash) (*Invoice, error) {
 
-	rpcCtx, cancel := context.WithTimeout(ctx, rpcTimeout)
+	rpcCtx, cancel := context.WithTimeout(ctx, s.timeout)
 	defer cancel()
 
 	rpcIn := &lnrpc.PaymentHash{
@@ -1256,6 +1522,7 @@ func unmarshalInvoice(resp *lnrpc.Invoice) (*Invoice, error) {
 			ChannelID:     lnwire.NewShortChanIDFromInt(htlc.ChanId),
 			Amount:        lnwire.MilliSatoshi(htlc.AmtMsat),
 			CustomRecords: htlc.CustomRecords,
+			State:         htlc.State,
 		}
 
 		if htlc.AcceptTime != 0 {
@@ -1307,7 +1574,7 @@ func unmarshalInvoice(resp *lnrpc.Invoice) (*Invoice, error) {
 func (s *lightningClient) ListTransactions(ctx context.Context, startHeight,
 	endHeight int32) ([]Transaction, error) {
 
-	rpcCtx, cancel := context.WithTimeout(ctx, rpcTimeout)
+	rpcCtx, cancel := context.WithTimeout(ctx, s.timeout)
 	defer cancel()
 
 	rpcCtx = s.adminMac.WithMacaroonAuth(rpcCtx)
@@ -1348,15 +1615,18 @@ func (s *lightningClient) ListTransactions(ctx context.Context, startHeight,
 }
 
 // ListChannels retrieves all channels of the backing lnd node.
-func (s *lightningClient) ListChannels(ctx context.Context) (
-	[]ChannelInfo, error) {
+func (s *lightningClient) ListChannels(ctx context.Context, activeOnly,
+	publicOnly bool) ([]ChannelInfo, error) {
 
-	rpcCtx, cancel := context.WithTimeout(ctx, rpcTimeout)
+	rpcCtx, cancel := context.WithTimeout(ctx, s.timeout)
 	defer cancel()
 
 	response, err := s.client.ListChannels(
 		s.adminMac.WithMacaroonAuth(rpcCtx),
-		&lnrpc.ListChannelsRequest{},
+		&lnrpc.ListChannelsRequest{
+			ActiveOnly: activeOnly,
+			PublicOnly: publicOnly,
+		},
 	)
 	if err != nil {
 		return nil, err
@@ -1364,7 +1634,7 @@ func (s *lightningClient) ListChannels(ctx context.Context) (
 
 	result := make([]ChannelInfo, len(response.Channels))
 	for i, channel := range response.Channels {
-		channelInfo, err := newChannelInfo(channel)
+		channelInfo, err := s.newChannelInfo(channel)
 		if err != nil {
 			return nil, err
 		}
@@ -1462,7 +1732,7 @@ type WaitingCloseChannel struct {
 func (s *lightningClient) PendingChannels(ctx context.Context) (*PendingChannels,
 	error) {
 
-	rpcCtx, cancel := context.WithTimeout(ctx, rpcTimeout)
+	rpcCtx, cancel := context.WithTimeout(ctx, s.timeout)
 	defer cancel()
 
 	resp, err := s.client.PendingChannels(
@@ -1587,7 +1857,7 @@ func getClosedChannel(closeSummary *lnrpc.ChannelCloseSummary) (
 func (s *lightningClient) ClosedChannels(ctx context.Context) ([]ClosedChannel,
 	error) {
 
-	rpcCtx, cancel := context.WithTimeout(ctx, rpcTimeout)
+	rpcCtx, cancel := context.WithTimeout(ctx, s.timeout)
 	defer cancel()
 
 	response, err := s.client.ClosedChannels(
@@ -1734,7 +2004,7 @@ type ForwardingEvent struct {
 func (s *lightningClient) ForwardingHistory(ctx context.Context,
 	req ForwardingHistoryRequest) (*ForwardingHistoryResponse, error) {
 
-	rpcCtx, cancel := context.WithTimeout(ctx, rpcTimeout)
+	rpcCtx, cancel := context.WithTimeout(ctx, s.timeout)
 	defer cancel()
 
 	response, err := s.client.ForwardingHistory(
@@ -1753,7 +2023,7 @@ func (s *lightningClient) ForwardingHistory(ctx context.Context,
 	events := make([]ForwardingEvent, len(response.ForwardingEvents))
 	for i, event := range response.ForwardingEvents {
 		events[i] = ForwardingEvent{
-			Timestamp:     time.Unix(int64(event.Timestamp), 0),
+			Timestamp:     time.Unix(int64(event.Timestamp), 0), // nolint:staticcheck
 			ChannelIn:     event.ChanIdIn,
 			ChannelOut:    event.ChanIdOut,
 			AmountMsatIn:  lnwire.MilliSatoshi(event.AmtInMsat),
@@ -1801,7 +2071,7 @@ type ListInvoicesResponse struct {
 func (s *lightningClient) ListInvoices(ctx context.Context,
 	req ListInvoicesRequest) (*ListInvoicesResponse, error) {
 
-	rpcCtx, cancel := context.WithTimeout(ctx, rpcTimeout)
+	rpcCtx, cancel := context.WithTimeout(ctx, s.timeout)
 	defer cancel()
 
 	resp, err := s.client.ListInvoices(
@@ -1897,7 +2167,7 @@ type ListPaymentsResponse struct {
 func (s *lightningClient) ListPayments(ctx context.Context,
 	req ListPaymentsRequest) (*ListPaymentsResponse, error) {
 
-	rpcCtx, cancel := context.WithTimeout(ctx, rpcTimeout)
+	rpcCtx, cancel := context.WithTimeout(ctx, s.timeout)
 	defer cancel()
 
 	resp, err := s.client.ListPayments(
@@ -1960,7 +2230,7 @@ func (s *lightningClient) ListPayments(ctx context.Context,
 func (s *lightningClient) ChannelBackup(ctx context.Context,
 	channelPoint wire.OutPoint) ([]byte, error) {
 
-	rpcCtx, cancel := context.WithTimeout(ctx, rpcTimeout)
+	rpcCtx, cancel := context.WithTimeout(ctx, s.timeout)
 	defer cancel()
 
 	rpcCtx = s.adminMac.WithMacaroonAuth(rpcCtx)
@@ -1983,7 +2253,7 @@ func (s *lightningClient) ChannelBackup(ctx context.Context,
 // ChannelBackups retrieves backups for all existing pending open and open
 // channels. The backups are returned as an encrypted chanbackup.Multi payload.
 func (s *lightningClient) ChannelBackups(ctx context.Context) ([]byte, error) {
-	rpcCtx, cancel := context.WithTimeout(ctx, rpcTimeout)
+	rpcCtx, cancel := context.WithTimeout(ctx, s.timeout)
 	defer cancel()
 
 	rpcCtx = s.adminMac.WithMacaroonAuth(rpcCtx)
@@ -1998,8 +2268,8 @@ func (s *lightningClient) ChannelBackups(ctx context.Context) ([]byte, error) {
 
 // getOutPoint is a helper go convert a hash and output index to
 // a wire.OutPoint object.
-func getOutPoint(txId []byte, idx uint32) (*wire.OutPoint, error) {
-	hash, err := chainhash.NewHash(txId)
+func getOutPoint(txID []byte, idx uint32) (*wire.OutPoint, error) {
+	hash, err := chainhash.NewHash(txID)
 	if err != nil {
 		return nil, err
 	}
@@ -2012,7 +2282,8 @@ func getOutPoint(txId []byte, idx uint32) (*wire.OutPoint, error) {
 
 // getChannelEventUpdate converts an lnrpc.ChannelEventUpdate to the higher
 // level ChannelEventUpdate.
-func getChannelEventUpdate(rpcChannelEventUpdate *lnrpc.ChannelEventUpdate) (
+func (s *lightningClient) getChannelEventUpdate(
+	rpcChannelEventUpdate *lnrpc.ChannelEventUpdate) (
 	*ChannelEventUpdate, error) {
 
 	result := &ChannelEventUpdate{}
@@ -2034,7 +2305,7 @@ func getChannelEventUpdate(rpcChannelEventUpdate *lnrpc.ChannelEventUpdate) (
 		result.UpdateType = OpenChannelUpdate
 		channel := rpcChannelEventUpdate.GetOpenChannel()
 
-		result.OpenedChannelInfo, err = newChannelInfo(channel)
+		result.OpenedChannelInfo, err = s.newChannelInfo(channel)
 		if err != nil {
 			return nil, err
 		}
@@ -2050,10 +2321,10 @@ func getChannelEventUpdate(rpcChannelEventUpdate *lnrpc.ChannelEventUpdate) (
 	case lnrpc.ChannelEventUpdate_ACTIVE_CHANNEL:
 		result.UpdateType = ActiveChannelUpdate
 		channelPoint := rpcChannelEventUpdate.GetActiveChannel()
-		fundingTxId := channelPoint.FundingTxid.(*lnrpc.ChannelPoint_FundingTxidBytes)
+		fundingTxID := channelPoint.FundingTxid.(*lnrpc.ChannelPoint_FundingTxidBytes)
 
 		result.ChannelPoint, err = getOutPoint(
-			fundingTxId.FundingTxidBytes,
+			fundingTxID.FundingTxidBytes,
 			channelPoint.OutputIndex,
 		)
 		if err != nil {
@@ -2063,10 +2334,10 @@ func getChannelEventUpdate(rpcChannelEventUpdate *lnrpc.ChannelEventUpdate) (
 	case lnrpc.ChannelEventUpdate_INACTIVE_CHANNEL:
 		result.UpdateType = InactiveChannelUpdate
 		channelPoint := rpcChannelEventUpdate.GetInactiveChannel()
-		fundingTxId := channelPoint.FundingTxid.(*lnrpc.ChannelPoint_FundingTxidBytes)
+		fundingTxID := channelPoint.FundingTxid.(*lnrpc.ChannelPoint_FundingTxidBytes)
 
 		result.ChannelPoint, err = getOutPoint(
-			fundingTxId.FundingTxidBytes,
+			fundingTxID.FundingTxidBytes,
 			channelPoint.OutputIndex,
 		)
 		if err != nil {
@@ -2109,7 +2380,7 @@ func (s *lightningClient) SubscribeChannelEvents(ctx context.Context) (
 				return
 			}
 
-			update, err := getChannelEventUpdate(rpcUpdate)
+			update, err := s.getChannelEventUpdate(rpcUpdate)
 			if err != nil {
 				errChan <- err
 				return
@@ -2194,7 +2465,7 @@ type PaymentRequest struct {
 func (s *lightningClient) DecodePaymentRequest(ctx context.Context,
 	payReq string) (*PaymentRequest, error) {
 
-	rpcCtx, cancel := context.WithTimeout(ctx, rpcTimeout)
+	rpcCtx, cancel := context.WithTimeout(ctx, s.timeout)
 	defer cancel()
 
 	rpcCtx = s.adminMac.WithMacaroonAuth(rpcCtx)
@@ -2242,7 +2513,7 @@ func (s *lightningClient) DecodePaymentRequest(ctx context.Context,
 func (s *lightningClient) OpenChannel(ctx context.Context, peer route.Vertex,
 	localSat, pushSat btcutil.Amount, private bool) (*wire.OutPoint, error) {
 
-	rpcCtx, cancel := context.WithTimeout(ctx, rpcTimeout)
+	rpcCtx, cancel := context.WithTimeout(ctx, s.timeout)
 	defer cancel()
 
 	rpcCtx = s.adminMac.WithMacaroonAuth(rpcCtx)
@@ -2464,7 +2735,7 @@ type PolicyUpdateRequest struct {
 func (s *lightningClient) UpdateChanPolicy(ctx context.Context,
 	req PolicyUpdateRequest, chanPoint *wire.OutPoint) error {
 
-	rpcCtx, cancel := context.WithTimeout(ctx, rpcTimeout)
+	rpcCtx, cancel := context.WithTimeout(ctx, s.timeout)
 	defer cancel()
 
 	rpcCtx = s.adminMac.WithMacaroonAuth(rpcCtx)
@@ -2486,7 +2757,7 @@ func (s *lightningClient) UpdateChanPolicy(ctx context.Context,
 			FundingTxid: &lnrpc.ChannelPoint_FundingTxidBytes{
 				FundingTxidBytes: chanPoint.Hash[:],
 			},
-			OutputIndex: uint32(chanPoint.Index),
+			OutputIndex: chanPoint.Index,
 		}
 		rpcReq.Scope = &lnrpc.PolicyUpdateRequest_ChanPoint{
 			ChanPoint: rpcChanPoint,
@@ -2530,10 +2801,10 @@ type RoutingPolicy struct {
 
 // ChannelEdge holds the channel edge information and routing policies.
 type ChannelEdge struct {
-	// The unique channel ID for the channel. The first 3 bytes are the
-	// block height, the next 3 the index within the block, and the last
-	// 2 bytes are the output index for the channel.
-	ChannelId uint64
+	// ChannelID is the unique channel ID for the channel. The first 3 bytes
+	// are the block height, the next 3 the index within the block, and the
+	// last 2 bytes are the output index for the channel.
+	ChannelID uint64
 
 	// ChannelPoint is the funding outpoint of the channel.
 	ChannelPoint string
@@ -2573,16 +2844,16 @@ func getRoutingPolicy(policy *lnrpc.RoutingPolicy) *RoutingPolicy {
 
 // GetChanInfo returns the channel info for the passed channel, including the
 // routing policy for both end.
-func (s *lightningClient) GetChanInfo(ctx context.Context, channelId uint64) (
+func (s *lightningClient) GetChanInfo(ctx context.Context, channelID uint64) (
 	*ChannelEdge, error) {
 
-	rpcCtx, cancel := context.WithTimeout(ctx, rpcTimeout)
+	rpcCtx, cancel := context.WithTimeout(ctx, s.timeout)
 	defer cancel()
 
 	rpcCtx = s.adminMac.WithMacaroonAuth(rpcCtx)
 
 	rpcRes, err := s.client.GetChanInfo(rpcCtx, &lnrpc.ChanInfoRequest{
-		ChanId: channelId,
+		ChanId: channelID,
 	})
 	if err != nil {
 		return nil, err
@@ -2603,7 +2874,7 @@ func newChannelEdge(rpcRes *lnrpc.ChannelEdge) (*ChannelEdge, error) {
 	}
 
 	return &ChannelEdge{
-		ChannelId:    rpcRes.ChannelId,
+		ChannelID:    rpcRes.ChannelId,
 		ChannelPoint: rpcRes.ChanPoint,
 		Capacity:     btcutil.Amount(rpcRes.Capacity),
 		Node1:        vertex1,
@@ -2617,7 +2888,7 @@ func newChannelEdge(rpcRes *lnrpc.ChannelEdge) (*ChannelEdge, error) {
 func (s *lightningClient) ListPeers(ctx context.Context) ([]Peer,
 	error) {
 
-	rpcCtx, cancel := context.WithTimeout(ctx, rpcTimeout)
+	rpcCtx, cancel := context.WithTimeout(ctx, s.timeout)
 	defer cancel()
 
 	rpcCtx = s.adminMac.WithMacaroonAuth(rpcCtx)
@@ -2655,7 +2926,7 @@ func (s *lightningClient) ListPeers(ctx context.Context) ([]Peer,
 func (s *lightningClient) Connect(ctx context.Context, peer route.Vertex,
 	host string, permanent bool) error {
 
-	rpcCtx, cancel := context.WithTimeout(ctx, rpcTimeout)
+	rpcCtx, cancel := context.WithTimeout(ctx, s.timeout)
 	defer cancel()
 
 	rpcCtx = s.adminMac.WithMacaroonAuth(rpcCtx)
@@ -2679,7 +2950,7 @@ func (s *lightningClient) SendCoins(ctx context.Context, addr btcutil.Address,
 	amount btcutil.Amount, sendAll bool, confTarget int32,
 	satsPerByte int64, label string) (string, error) {
 
-	rpcCtx, cancel := context.WithTimeout(ctx, rpcTimeout)
+	rpcCtx, cancel := context.WithTimeout(ctx, s.timeout)
 	defer cancel()
 
 	rpcCtx = s.adminMac.WithMacaroonAuth(rpcCtx)
@@ -2705,7 +2976,7 @@ func (s *lightningClient) SendCoins(ctx context.Context, addr btcutil.Address,
 func (s *lightningClient) ChannelBalance(ctx context.Context) (*ChannelBalance,
 	error) {
 
-	rpcCtx, cancel := context.WithTimeout(ctx, rpcTimeout)
+	rpcCtx, cancel := context.WithTimeout(ctx, s.timeout)
 	defer cancel()
 
 	rpcCtx = s.adminMac.WithMacaroonAuth(rpcCtx)
@@ -2718,8 +2989,8 @@ func (s *lightningClient) ChannelBalance(ctx context.Context) (*ChannelBalance,
 	}
 
 	return &ChannelBalance{
-		Balance:        btcutil.Amount(resp.Balance),
-		PendingBalance: btcutil.Amount(resp.PendingOpenBalance),
+		Balance:        btcutil.Amount(resp.Balance),            // nolint:staticcheck
+		PendingBalance: btcutil.Amount(resp.PendingOpenBalance), // nolint:staticcheck
 	}, nil
 }
 
@@ -2727,7 +2998,7 @@ func (s *lightningClient) ChannelBalance(ctx context.Context) (*ChannelBalance,
 func (s *lightningClient) GetNodeInfo(ctx context.Context, pubkey route.Vertex,
 	includeChannels bool) (*NodeInfo, error) {
 
-	rpcCtx, cancel := context.WithTimeout(ctx, rpcTimeout)
+	rpcCtx, cancel := context.WithTimeout(ctx, s.timeout)
 	defer cancel()
 
 	rpcCtx = s.adminMac.WithMacaroonAuth(rpcCtx)
@@ -2768,7 +3039,7 @@ func (s *lightningClient) GetNodeInfo(ctx context.Context, pubkey route.Vertex,
 func (s *lightningClient) DescribeGraph(ctx context.Context,
 	includeUnannounced bool) (*Graph, error) {
 
-	rpcCtx, cancel := context.WithTimeout(ctx, rpcTimeout)
+	rpcCtx, cancel := context.WithTimeout(ctx, s.timeout)
 	defer cancel()
 
 	rpcCtx = s.adminMac.WithMacaroonAuth(rpcCtx)
@@ -2872,22 +3143,22 @@ func getGraphTopologyUpdate(update *lnrpc.GraphTopologyUpdate) (
 			return nil, err
 		}
 
-		rawFeatureVector := &lnwire.RawFeatureVector{}
-		err = rawFeatureVector.Decode(
-			bytes.NewReader(nodeUpdate.GlobalFeatures),
-		)
-		if err != nil {
-			return nil, err
-		}
-
 		result.NodeUpdates[i] = NodeUpdate{
-			Addresses:   nodeUpdate.Addresses,
+			Addresses:   nodeUpdate.Addresses, // nolint:staticcheck
 			IdentityKey: identityKey,
-			GlobalFeatures: *lnwire.NewFeatureVector(
-				rawFeatureVector, lnwire.Features,
+			Features: make(
+				[]lnwire.FeatureBit, 0,
+				len(nodeUpdate.Features),
 			),
 			Alias: nodeUpdate.Alias,
 			Color: nodeUpdate.Color,
+		}
+
+		for featureBit := range nodeUpdate.Features {
+			result.NodeUpdates[i].Features = append(
+				result.NodeUpdates[i].Features,
+				lnwire.FeatureBit(featureBit),
+			)
 		}
 	}
 
@@ -2920,6 +3191,8 @@ func getGraphTopologyUpdate(update *lnrpc.GraphTopologyUpdate) (
 			),
 			ChannelPoint: *channelPoint,
 			Capacity:     btcutil.Amount(channelUpdate.Capacity),
+			// Note: routing policy is always set in lnd's
+			// rpcserver.go and therefore should never be nil.
 			RoutingPolicy: *getRoutingPolicy(
 				channelUpdate.RoutingPolicy,
 			),
@@ -2954,7 +3227,7 @@ func getGraphTopologyUpdate(update *lnrpc.GraphTopologyUpdate) (
 func (s *lightningClient) NetworkInfo(ctx context.Context) (*NetworkInfo,
 	error) {
 
-	rpcCtx, cancel := context.WithTimeout(ctx, rpcTimeout)
+	rpcCtx, cancel := context.WithTimeout(ctx, s.timeout)
 	defer cancel()
 
 	rpcCtx = s.adminMac.WithMacaroonAuth(rpcCtx)
@@ -3041,4 +3314,253 @@ func (s *lightningClient) SubscribeInvoices(ctx context.Context,
 	}()
 
 	return invoiceUpdates, streamErr, nil
+}
+
+// MacaroonPermission is a struct that holds a permission entry, consisting of
+// an entity and an action.
+type MacaroonPermission struct {
+	// Entity is the entity a permission grants access to.
+	Entity string
+
+	// Action is the action that is granted by a permission.
+	Action string
+}
+
+// String returns the human readable representation of a permission.
+func (p *MacaroonPermission) String() string {
+	return fmt.Sprintf("%s:%s", p.Entity, p.Action)
+}
+
+// ListPermissions returns a list of all RPC method URIs and the macaroon
+// permissions that are required to access them.
+func (s *lightningClient) ListPermissions(
+	ctx context.Context) (map[string][]MacaroonPermission, error) {
+
+	rpcCtx, cancel := context.WithTimeout(ctx, s.timeout)
+	defer cancel()
+
+	rpcCtx = s.adminMac.WithMacaroonAuth(rpcCtx)
+	perms, err := s.client.ListPermissions(
+		rpcCtx, &lnrpc.ListPermissionsRequest{},
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	result := make(map[string][]MacaroonPermission)
+	for methodURI, list := range perms.MethodPermissions {
+		permissions := list.Permissions
+		result[methodURI] = make([]MacaroonPermission, len(permissions))
+		for idx, entry := range permissions {
+			result[methodURI][idx] = MacaroonPermission{
+				Entity: entry.Entity,
+				Action: entry.Action,
+			}
+		}
+	}
+
+	return result, nil
+}
+
+// AcceptorFunction is the signature used for functions passed to our channel
+// acceptor.
+type AcceptorFunction func(context.Context,
+	*AcceptorRequest) (*AcceptorResponse, error)
+
+// ChannelAcceptor create a channel acceptor using the accept function passed
+// in. The timeout provided will be used to timeout the passed accept closure
+// when it exceeds the amount of time we allow. Note that this amount should be
+// strictly less than lnd's chanacceptor timeout parameter.
+func (s *lightningClient) ChannelAcceptor(ctx context.Context,
+	timeout time.Duration, accept AcceptorFunction) (chan error, error) {
+
+	acceptStream, err := s.client.ChannelAcceptor(
+		s.adminMac.WithMacaroonAuth(ctx),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	errChan := make(chan error, 1)
+
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+
+		for {
+			select {
+			case <-ctx.Done():
+				errChan <- ctx.Err()
+				return
+
+			default:
+			}
+
+			request, err := acceptStream.Recv()
+			if err != nil {
+				errChan <- fmt.Errorf("channel acceptor "+
+					"receive failed: %v", err)
+
+				return
+			}
+
+			accReq, err := newAcceptorRequest(request)
+			if err != nil {
+				errChan <- fmt.Errorf("invalid request sent "+
+					"from lnd: %v", err)
+
+				return
+			}
+
+			// Create a child context for our accept function which
+			// will timeout after the timeout period provided.
+			ctxt, cancel := context.WithTimeout(ctx, timeout)
+
+			resp, err := accept(ctxt, accReq)
+			cancel()
+			if err != nil {
+				errChan <- fmt.Errorf("accept function "+
+					"failed: %v", err)
+
+				return
+			}
+
+			rpcResp := &lnrpc.ChannelAcceptResponse{
+				Accept:          resp.Accept,
+				PendingChanId:   request.PendingChanId,
+				Error:           resp.Error,
+				UpfrontShutdown: resp.UpfrontShutdown,
+				CsvDelay:        resp.CsvDelay,
+				ReserveSat:      resp.ReserveSat,
+				InFlightMaxMsat: resp.InFlightMaxMsat,
+				MaxHtlcCount:    resp.MaxHtlcCount,
+				MinHtlcIn:       resp.MinHtlcIn,
+				MinAcceptDepth:  resp.MinAcceptDepth,
+			}
+
+			if err := acceptStream.Send(rpcResp); err != nil {
+				errChan <- fmt.Errorf("channel acceptor send "+
+					"failed: %v", err)
+
+				return
+			}
+		}
+	}()
+
+	return errChan, nil
+}
+
+// unmarshallHop unmarshalls a single hop.
+func unmarshallHop(rpcHop *lnrpc.Hop) (*Hop, error) {
+	var pubKey *route.Vertex
+
+	if rpcHop.PubKey != "" {
+		vertex, err := route.NewVertexFromStr(rpcHop.PubKey)
+		if err != nil {
+			return nil, err
+		}
+		pubKey = &vertex
+	}
+
+	return &Hop{
+		ChannelID:        rpcHop.ChanId,
+		Expiry:           rpcHop.Expiry,
+		AmtToForwardMsat: lnwire.MilliSatoshi(rpcHop.AmtToForwardMsat),
+		FeeMsat:          lnwire.MilliSatoshi(rpcHop.FeeMsat),
+		PubKey:           pubKey,
+	}, nil
+}
+
+// QueryRoutes can query LND to return a route (with fees) between two vertices.
+func (s *lightningClient) QueryRoutes(ctx context.Context,
+	req QueryRoutesRequest) (*QueryRoutesResponse, error) {
+
+	rpcCtx, cancel := context.WithTimeout(ctx, s.timeout)
+	defer cancel()
+
+	rpcCtx = s.adminMac.WithMacaroonAuth(rpcCtx)
+	rpcReq := &lnrpc.QueryRoutesRequest{
+		PubKey:  req.PubKey.String(),
+		AmtMsat: int64(req.AmtMsat),
+		FeeLimit: &lnrpc.FeeLimit{
+			Limit: &lnrpc.FeeLimit_FixedMsat{
+				FixedMsat: int64(req.FeeLimitMsat),
+			},
+		},
+		UseMissionControl: req.UseMissionControl,
+	}
+
+	if req.Source != nil {
+		rpcReq.SourcePubKey = req.Source.String()
+	}
+
+	if req.MaxCltv != nil {
+		rpcReq.CltvLimit = *req.MaxCltv
+	}
+
+	if req.LastHop != nil {
+		rpcReq.LastHopPubkey = req.LastHop[:]
+	}
+
+	var err error
+	rpcReq.RouteHints, err = marshallRouteHints(req.RouteHints)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := s.client.QueryRoutes(rpcCtx, rpcReq)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(resp.Routes) == 0 {
+		return nil, ErrNoRouteFound
+	}
+
+	route := resp.Routes[0]
+	hops := make([]*Hop, len(route.Hops))
+	for i, rpcHop := range route.Hops {
+		hops[i], err = unmarshallHop(rpcHop)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return &QueryRoutesResponse{
+		TotalTimeLock: route.TotalTimeLock,
+		Hops:          hops,
+		TotalFeesMsat: lnwire.MilliSatoshi(route.TotalFeesMsat),
+		TotalAmtMsat:  lnwire.MilliSatoshi(route.TotalAmtMsat),
+	}, nil
+}
+
+// CheckMacaroonPermissions allows a client to check the validity of a macaroon.
+func (s *lightningClient) CheckMacaroonPermissions(ctx context.Context,
+	macaroon []byte, permissions []MacaroonPermission, fullMethod string) (bool,
+	error) {
+
+	rpcPermissions := make([]*lnrpc.MacaroonPermission, len(permissions))
+	for idx, perm := range permissions {
+		rpcPermissions[idx] = &lnrpc.MacaroonPermission{
+			Entity: perm.Entity,
+			Action: perm.Action,
+		}
+	}
+
+	ctx = s.adminMac.WithMacaroonAuth(ctx)
+	rpcCtx, cancel := context.WithTimeout(ctx, s.timeout)
+	defer cancel()
+
+	res, err := s.client.CheckMacaroonPermissions(
+		rpcCtx, &lnrpc.CheckMacPermRequest{
+			Macaroon:    macaroon,
+			Permissions: rpcPermissions,
+			FullMethod:  fullMethod,
+		},
+	)
+	if err != nil {
+		return false, err
+	}
+
+	return res.Valid, nil
 }
